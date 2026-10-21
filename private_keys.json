@@ -1,0 +1,30 @@
+{
+    "healthcare-supervisor": {
+        "identity_key": "ba609e73a41fc2d6653159a5fd55318fb3339491e055445c5dec0ef91f64004a",
+        "wallet_key": "nQpQPjDShP434linNkeZmKtVuSyBj03kS3Wdwp9l7FU="
+    },
+    "healthcare-ehr-search": {
+        "identity_key": "7c9e0c583a653cb8c85f53ff07a850af6c6412a78add7792d30aebba8ac46d89",
+        "wallet_key": "MgMAGJbcH24kMx9uQeESkMd/O8B8HPx5kLjQjXCa5zM="
+    },
+    "healthcare-math-analytics": {
+        "identity_key": "19320c29bdc55bbc6b31c0e557297788a59dff526f753fddbf3ffa0907bf0854",
+        "wallet_key": "9WnH7YGdYM1JqS21xOeElk91cEwuIvuLLeZEb/MTQDo="
+    },
+    "healthcare-clinical-triage": {
+        "identity_key": "f3e1114b961cb18f62c8469384134e49e3c1d5dd5f748805f2b5fe84b0b04e59",
+        "wallet_key": "hjaf7iONno2AUzWBLjoIkkbkz66Uq2H8E67RnCWaag0="
+    },
+    "healthcare-document-generator": {
+        "identity_key": "c54b0c45554f57caf35e5bdfbf3ac83fd8a7c1edaa8611140d7492298d44f914",
+        "wallet_key": "uyY7BGJURsn2xXnM1Kq4VBxlQ6Q+NqlxwPRPafxVcRo="
+    },
+    "healthcare-workspace-sync": {
+        "identity_key": "e156daae2074e2a8cb3012752b10270c550c0fc7c631342031c9cd204eed8e70",
+        "wallet_key": "QLrQSuDhcwJ52knWKYq/kmLd/t5T7yJohqqF/f28PQ0="
+    },
+    "healthcare-compliance-audit": {
+        "identity_key": "98dc072e51221bc5d102766baefc53d3e6b50b808cab332910446c8b2fa03934",
+        "wallet_key": "naUG59Snx0gUF49/two+GyxwdYrpkQhkQTBB5W3EnsI="
+    }
+}

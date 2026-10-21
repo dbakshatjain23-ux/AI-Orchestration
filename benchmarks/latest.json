@@ -1,0 +1,23 @@
+{
+  "runs": 3,
+  "rows": 55500,
+  "advanced_matches": 6489,
+  "median_seconds": {
+    "cached_load_s": 0.323,
+    "exact_200_first_s": 2.8204,
+    "exact_200_hot_s": 2.433,
+    "advanced_flow_s": 0.2357
+  },
+  "budgets_seconds": {
+    "cached_load_s": 2.5,
+    "exact_200_first_s": 4.5,
+    "exact_200_hot_s": 3.5,
+    "advanced_flow_s": 1.5
+  },
+  "budget_status": {
+    "cached_load_s": "pass",
+    "exact_200_first_s": "pass",
+    "exact_200_hot_s": "pass",
+    "advanced_flow_s": "pass"
+  }
+}

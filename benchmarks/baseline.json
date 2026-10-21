@@ -1,0 +1,10 @@
+{
+  "captured_before_optimization": true,
+  "dataset_rows": 55500,
+  "advanced_matches": 6489,
+  "seconds": {
+    "cold_csv_load_s": 3.9238,
+    "exact_200_s": 6.1336,
+    "advanced_flow_s": 3.9878
+  }
+}
