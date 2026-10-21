@@ -1,0 +1,48 @@
+{
+  "deployment_order": [
+    "ehr",
+    "analytics",
+    "triage",
+    "documents",
+    "workspace",
+    "compliance",
+    "supervisor"
+  ],
+  "profiles": {
+    "ehr": {
+      "name": "CareFlow EHR Search",
+      "keywords": ["healthcare", "EHR", "patient records", "cohort search"],
+      "description": "Grounded search over synthetic encounter data. Returns exact records and explicit not-found results without inventing patient facts."
+    },
+    "analytics": {
+      "name": "CareFlow Healthcare Analytics",
+      "keywords": ["healthcare analytics", "statistics", "hospital operations"],
+      "description": "Deterministic healthcare operations statistics, comparisons, rankings, billing summaries, and cohort metrics."
+    },
+    "triage": {
+      "name": "CareFlow Administrative Triage",
+      "keywords": ["triage", "human review", "escalation", "healthcare safety"],
+      "description": "Reports recorded acuity, review, and escalation fields for administrative routing. It does not diagnose or infer clinical thresholds."
+    },
+    "documents": {
+      "name": "CareFlow Document Generator",
+      "keywords": ["PDF", "case review", "discharge summary", "invoice"],
+      "description": "Creates administrative review packages, discharge summaries, and accounting PDFs from grounded specialist data."
+    },
+    "workspace": {
+      "name": "CareFlow Workspace Actions",
+      "keywords": ["approval", "Gmail", "Calendar", "Sheets"],
+      "description": "Prepares external Workspace actions behind explicit approval. Google execution remains disabled unless deployment secrets explicitly enable it."
+    },
+    "compliance": {
+      "name": "CareFlow Compliance and Audit",
+      "keywords": ["consent", "audit", "guardian", "healthcare compliance"],
+      "description": "Checks recorded communication consent and guardian requirements and writes append-only workflow decision evidence."
+    },
+    "supervisor": {
+      "name": "CareFlow AI Hospital Operations Supervisor",
+      "keywords": ["multi-agent", "hospital operations", "ASI One", "care workflow"],
+      "description": "ASI:One-powered supervisor that turns hospital operations goals into adaptive specialist plans, streams progress, requests human approval through interactive cards, and produces audited review outcomes."
+    }
+  }
+}

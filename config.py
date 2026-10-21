@@ -9,7 +9,7 @@ from pathlib import Path
 try:
     from dotenv import load_dotenv
 except ImportError:  # Keep local deterministic tools usable before full install.
-    def load_dotenv(*_args, **_kwargs):
+    def load_dotenv(*_args, **_kwargs) -> bool:
         return False
 
 
@@ -30,12 +30,37 @@ def _int_env(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "").strip().casefold()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true/false, yes/no, on/off, or 1/0")
+
+
+def _path_env(name: str, default: Path) -> Path:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT_DIR / path
+
+
 @dataclass(frozen=True)
 class Settings:
-    dataset_path: Path = ROOT_DIR / "docs" / "sample_dataset.csv"
-    output_dir: Path = ROOT_DIR / "output"
-    sqlite_path: Path = ROOT_DIR / "output" / "healthcare.sqlite"
-    parquet_path: Path = ROOT_DIR / "output" / "healthcare.parquet"
+    dataset_path: Path = _path_env(
+        "DATASET_PATH", ROOT_DIR / "docs" / "sample_dataset.csv"
+    )
+    output_dir: Path = _path_env("OUTPUT_DIR", ROOT_DIR / "output")
+    sqlite_path: Path = _path_env(
+        "SQLITE_PATH", ROOT_DIR / "output" / "healthcare.sqlite"
+    )
+    parquet_path: Path = _path_env(
+        "PARQUET_PATH", ROOT_DIR / "output" / "healthcare.parquet"
+    )
     asi_one_api_key: str = os.getenv("ASI_ONE_API_KEY", "")
     asi_one_model: str = os.getenv("ASI_ONE_MODEL", "asi1")
     asi_one_base_url: str = os.getenv(
@@ -48,6 +73,11 @@ class Settings:
     agent_seed: str = os.getenv("AGENT_SEED", "")
     time_zone: str = os.getenv("TIME_ZONE", "Asia/Kolkata")
     agent_public_base_url: str = os.getenv("AGENT_PUBLIC_BASE_URL", "").rstrip("/")
+    agent_endpoint: str = os.getenv("AGENT_ENDPOINT", "").strip()
+    agent_mailbox: bool = _bool_env("AGENT_MAILBOX", False)
+    concurrent_messages: bool = _bool_env("AGENT_CONCURRENT_MESSAGES", True)
+    enable_google_actions: bool = _bool_env("ENABLE_GOOGLE_ACTIONS", False)
+    enable_interactive_cards: bool = _bool_env("ENABLE_INTERACTIVE_CARDS", True)
     supervisor_port: int = _int_env("SUPERVISOR_PORT", 8000)
     max_external_concurrency: int = _int_env("MAX_EXTERNAL_CONCURRENCY", 4)
     agent_ports: tuple[int, ...] = tuple(
@@ -87,8 +117,14 @@ def agent_runtime_kwargs(name: str, slot: int) -> dict[str, object]:
     }
     if settings.agent_seed:
         kwargs["seed"] = f"{settings.agent_seed}:{name}"
-    if settings.agent_public_base_url:
+    if settings.agent_mailbox:
+        kwargs["mailbox"] = True
+    elif settings.agent_endpoint:
+        kwargs["endpoint"] = [settings.agent_endpoint]
+    elif settings.agent_public_base_url:
         kwargs["endpoint"] = [f"{settings.agent_public_base_url}/{name}/submit"]
+    if settings.concurrent_messages:
+        kwargs["handle_messages_concurrently"] = True
     return kwargs
 
 

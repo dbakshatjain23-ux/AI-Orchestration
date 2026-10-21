@@ -198,7 +198,10 @@ class DatasetLoader:
         for column in ("admission_date", "discharge_date"):
             if column in safe:
                 safe[column] = safe[column].dt.strftime("%Y-%m-%d")
-        return safe.where(safe.notna(), None).to_dict(orient="records")
+        return [
+            {str(key): value for key, value in record.items()}
+            for record in safe.where(safe.notna(), None).to_dict(orient="records")
+        ]
 
     @cached_property
     def _exact_text_indexes(self) -> dict[str, dict[str, list[int]]]:

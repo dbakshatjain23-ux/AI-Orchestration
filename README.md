@@ -1,8 +1,27 @@
 # Healthcare Agent Orchestration System
 
+![tag:innovationlab](https://img.shields.io/badge/innovationlab-3D8BD3)
+![tag:hackathon](https://img.shields.io/badge/hackathon-5F43F1)
+
+**CareFlow** is an AI hospital-operations supervisor that turns a natural-language
+goal into a grounded, auditable multi-agent workflow inside ASI:One.
+
 This repository implements the complete supervisor-led flow in `docs/user_flow.md`. A clinician or administrator talks to the Supervisor through Agent Chat Protocol; the Supervisor opens a stateful ASI:One planner session, exposes six narrow specialist agents, streams plan progress, pauses external actions for human approval, rechecks consent, executes approved Google Workspace actions, and records an append-only audit event.
 
 The 100-question catalogue is a regression suite for data coverage. It is not the application architecture or the primary runtime.
+
+## Where AI is used
+
+ASI:One is the reasoning layer: it interprets an open-ended objective, builds and
+adapts a plan, selects specialist agents, streams progress, synthesizes grounded
+results, and proposes tool calls. Exact retrieval, calculations, recorded triage
+fields, consent enforcement, PDF generation, and auditing remain deterministic.
+This separation prevents the LLM from inventing patient facts or overriding safety
+controls.
+
+The local CLI workflows deliberately bypass the LLM so they can be tested without
+network credentials. A live ASI:One demonstration requires the registered specialist
+addresses and exercises the AI planner path.
 
 ## Runtime architecture
 
@@ -15,6 +34,11 @@ The 100-question catalogue is a regression suite for data coverage. It is not th
 | Document Generator | 8004 | Discharge summaries, invoices, administrative review PDFs |
 | Workspace Sync | 8005 | Prepares Gmail, Calendar, and Sheets actions; never self-approves |
 | Compliance & Audit | 8006 | Consent/guardian checks and append-only JSONL audit events |
+
+The Supervisor also exposes an approval-gated
+`finalize_administrative_review` tool. It creates an abnormal-result/long-stay PDF
+package and audit evidence without requiring Google Workspace. ASI:One Interactive
+Cards provide native Approve/Deny controls and a terminal outcome view.
 
 Every service publishes the Agent Chat Protocol 0.3.0 manifest. Specialist agents accept both planner-friendly plain text and canonical structured JSON. The source CSV remains read-only; `main.py --build-index` creates an indexed SQLite copy plus a source-fingerprinted Parquet cache. Agents prefer the Parquet cache for fast startup and automatically fall back when it is missing or stale.
 
@@ -31,6 +55,11 @@ Required for live planning:
 - `ASI_ONE_API_KEY`
 - A stable, secret `AGENT_SEED`
 - `AGENT1_ADDRESS` through `AGENT6_ADDRESS` after the specialists are deployed or registered
+
+For Agentverse mailbox deployment set `AGENT_MAILBOX=true` and start one role with
+`python deploy_agent.py --agent <role>`. See
+[`docs/agentverse_deployment.md`](docs/agentverse_deployment.md) for the complete
+specialist-first registration sequence.
 
 Required for Google Workspace execution:
 
@@ -68,9 +97,13 @@ Or start a subset:
 
 Once deployed, put the six specialist `agent1q...` addresses in `.env`, start/deploy the Supervisor, then @mention it in ASI:One Chat. A representative full-flow prompt is:
 
-> Identify patients with abnormal test results and stays longer than 30 days, triage the cases, generate an administrative review PDF, sync the queue to Google Sheets, and prepare follow-up emails.
+> Find patients with abnormal results and stays longer than 30 days. Use the specialist agents to analyze and prioritize the cohort, then prepare an audited administrative review package with at most 10 detailed cases. Do not contact patients or use Google Workspace.
 
-The planner may call specialists immediately, but Gmail, Calendar, and Sheets calls return to the Supervisor as tools. The Supervisor asks for `approve` or `deny`, resumes with the same `x-session-id`, and records the decision and result.
+The planner may call specialists immediately, but durable report creation and optional
+Gmail, Calendar, and Sheets calls return to the Supervisor as tools. The Supervisor
+shows an ASI:One Review card, resumes with the same `x-session-id`, and records the
+decision and result. Google actions are hidden and blocked unless
+`ENABLE_GOOGLE_ACTIONS=true`.
 
 ## Deterministic local verification
 

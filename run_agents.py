@@ -75,8 +75,13 @@ def main() -> None:
         for process in processes:
             if process.is_alive():
                 process.terminate()
-        for process in processes:
-            process.join(timeout=5)
+        try:
+            for process in processes:
+                process.join(timeout=5)
+        except KeyboardInterrupt:
+            # A second Ctrl+C during Windows child cleanup should not print a
+            # misleading traceback after all agents have already been stopped.
+            pass
 
 
 if __name__ == "__main__":

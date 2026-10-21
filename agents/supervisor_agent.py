@@ -15,6 +15,60 @@ from agents.agent_5_workspace_sync import WorkspaceSyncAgent
 from agents.agent_6_compliance_audit import ComplianceAuditAgent
 from config import agent_runtime_kwargs, settings
 from services.questionnaire_engine import QuestionnaireEngine
+from services.workflow_orchestrator import WorkflowOrchestrator
+from utils.asi_cards import approval_card, outcome_card
+
+
+SUPERVISOR_SYSTEM_PROMPT = """You are CareFlow, an AI hospital-operations supervisor.
+Turn the user's goal into a transparent multi-agent plan and delegate factual work to
+the supplied specialist agents. Use EHR Search for records, Math & Analytics for exact
+calculations, Clinical Triage only for recorded acuity/escalation fields, Document
+Generator for administrative PDFs, Workspace Sync only when explicitly enabled, and
+Compliance & Audit for consent and decision evidence.
+
+Safety rules:
+- Never diagnose, prescribe, or invent clinical thresholds or missing records.
+- Clearly distinguish ASI:One reasoning from deterministic dataset facts.
+- Prefer independent specialist calls in parallel and respect dependencies.
+- If required data is missing, ask for it instead of guessing.
+- Use finalize_administrative_review when the user asks for a durable abnormal-result,
+  long-stay review package. It requires human approval before execution.
+- Explain blocked or partial outcomes and adapt the remaining plan safely.
+- Keep the final answer concise: objective, agents used, evidence, outcome, and any
+  human follow-up required.
+"""
+
+
+CORE_ACTION_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "finalize_administrative_review",
+            "description": (
+                "After specialist analysis, generate an audited PDF review package for "
+                "patients with abnormal results and long stays. Requires human approval."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minimum_days": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 3650,
+                    },
+                    "max_pdf_cases": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                    },
+                },
+                "required": ["minimum_days", "max_pdf_cases"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
 
 
 EXTERNAL_ACTION_TOOLS: list[dict[str, Any]] = [
@@ -76,6 +130,15 @@ EXTERNAL_ACTION_TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+def planner_tools() -> list[dict[str, Any]]:
+    """Return safe local tools plus optional Google Workspace actions."""
+
+    tools = list(CORE_ACTION_TOOLS)
+    if settings.enable_google_actions:
+        tools.extend(EXTERNAL_ACTION_TOOLS)
+    return tools
 
 
 _DONE = object()
@@ -183,7 +246,11 @@ class PendingToolCall:
 @dataclass
 class ConversationState:
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    messages: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(
+        default_factory=lambda: [
+            {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT}
+        ]
+    )
     pending_tool_calls: list[PendingToolCall] = field(default_factory=list)
     pending_assistant_message: dict[str, Any] | None = None
     last_progress: str = ""
@@ -194,18 +261,31 @@ class PlannerRun:
     content: str = ""
     tool_calls: list[PendingToolCall] = field(default_factory=list)
     progress_messages: list[str] = field(default_factory=list)
+    session_id: str | None = None
 
 
 class SupervisorService:
     """Coordinates planner sessions, specialist access, approvals, and audit."""
 
-    def __init__(self, ehr=None, analytics=None, planner=None) -> None:
+    def __init__(
+        self,
+        ehr=None,
+        analytics=None,
+        planner=None,
+        *,
+        allow_google_actions: bool | None = None,
+    ) -> None:
         self.ehr = ehr or EHRSearchAgent()
         self.analytics = analytics or MathAnalyticsAgent(self.ehr.loader)
         self.questionnaire = QuestionnaireEngine(self.ehr.loader)
         self.planner = planner or ASIOnePlannerClient()
         self.workspace = WorkspaceSyncAgent()
         self.compliance = ComplianceAuditAgent(self.ehr.loader)
+        self.allow_google_actions = (
+            settings.enable_google_actions
+            if allow_google_actions is None
+            else allow_google_actions
+        )
         self.sessions: dict[str, ConversationState] = {}
 
     def handle_local(self, query: str) -> dict[str, Any]:
@@ -214,9 +294,12 @@ class SupervisorService:
 
     def stream_planner(self, query: str, session_id: str | None = None):
         return self.planner.stream(
-            [{"role": "user", "content": query}],
+            [
+                {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT},
+                {"role": "user", "content": query},
+            ],
             session_id or str(uuid.uuid4()),
-            EXTERNAL_ACTION_TOOLS,
+            planner_tools(),
         )
 
     def state_for(self, sender: str) -> ConversationState:
@@ -228,16 +311,20 @@ class SupervisorService:
             decision = self._approval_decision(text)
             if decision is None:
                 names = ", ".join(call.name for call in state.pending_tool_calls)
-                return PlannerRun(content=f"Approval is pending for: {names}. Reply 'approve' or 'deny'.")
+                return PlannerRun(
+                    content=f"Approval is pending for: {names}. Reply 'approve' or 'deny'.",
+                    tool_calls=list(state.pending_tool_calls),
+                    session_id=state.session_id,
+                )
             return await self._resume_after_decision(state, approved=decision)
         state.messages.append({"role": "user", "content": text})
         return await self._run_planner(state)
 
     async def _run_planner(self, state: ConversationState) -> PlannerRun:
-        run = PlannerRun()
+        run = PlannerRun(session_id=state.session_id)
         fragments: dict[str, dict[str, Any]] = {}
         async for event in self.planner.stream_async(
-            state.messages, state.session_id, EXTERNAL_ACTION_TOOLS
+            state.messages, state.session_id, planner_tools()
         ):
             progress = self._progress_text(event)
             if progress and progress != state.last_progress:
@@ -275,7 +362,7 @@ class SupervisorService:
             )
         elif run.content:
             state.messages.append({"role": "assistant", "content": run.content})
-            state.messages = state.messages[-30:]
+            state.messages = [state.messages[0], *state.messages[-29:]]
         return run
 
     async def _resume_after_decision(self, state: ConversationState, *, approved: bool) -> PlannerRun:
@@ -327,7 +414,28 @@ class SupervisorService:
         self, call: PendingToolCall, session_id: str | None = None
     ) -> dict[str, Any]:
         arguments = call.arguments
-        if call.name == "send_gmail_outreach":
+        if call.name == "finalize_administrative_review":
+            minimum_days = int(arguments["minimum_days"])
+            max_pdf_cases = int(arguments["max_pdf_cases"])
+            if not 0 <= minimum_days <= 3650:
+                raise ValueError("minimum_days must be between 0 and 3650")
+            if not 1 <= max_pdf_cases <= 100:
+                raise ValueError("max_pdf_cases must be between 1 and 100")
+            workflow = WorkflowOrchestrator(self.ehr.loader)
+            package = workflow.prepare_advanced_review(
+                minimum_days=minimum_days,
+                spreadsheet_id=None,
+                prepare_outreach=False,
+                max_pdf_cases=max_pdf_cases,
+            ).as_dict()
+            result = {
+                "status": "completed",
+                "action": "finalize_administrative_review",
+                "summary": package["summary"],
+                "generated_files": package["generated_files"],
+                "external_actions_executed": False,
+            }
+        elif call.name == "send_gmail_outreach":
             patient_rows = self.ehr.find_patient_by_id(arguments["patient_id"])
             if patient_rows.empty:
                 result = {"status": "blocked", "reason": "patient_not_found"}
@@ -341,12 +449,23 @@ class SupervisorService:
                         "status": "blocked",
                         "reason": "recipient_does_not_match_patient_record",
                     }
+                elif not self.allow_google_actions:
+                    result = {
+                        "status": "blocked",
+                        "reason": "google_actions_disabled",
+                    }
                 else:
                     action = self.workspace.prepare_email(
                         arguments["to"], arguments["subject"], arguments["body"]
                     )
                     result = self.workspace.execute(action, approved=True)
         elif call.name == "create_calendar_review":
+            if not self.allow_google_actions:
+                result = {"status": "blocked", "reason": "google_actions_disabled"}
+                self._audit_tool_action(
+                    call, approved=True, result=result, session_id=session_id
+                )
+                return result
             attendees = []
             if arguments.get("attendee_email"):
                 attendees.append({"email": arguments["attendee_email"]})
@@ -359,6 +478,12 @@ class SupervisorService:
             )
             result = self.workspace.execute(action, approved=True)
         elif call.name == "append_patient_queue":
+            if not self.allow_google_actions:
+                result = {"status": "blocked", "reason": "google_actions_disabled"}
+                self._audit_tool_action(
+                    call, approved=True, result=result, session_id=session_id
+                )
+                return result
             action = self.workspace.prepare_sheet_append(
                 arguments["spreadsheet_id"], arguments["rows"], arguments.get("worksheet_name")
             )
@@ -391,11 +516,31 @@ class SupervisorService:
 
     @staticmethod
     def _approval_decision(text: str) -> bool | None:
-        normalized = re.sub(r"[^a-z]+", " ", text.casefold()).strip()
+        stripped = text.strip()
+        if stripped.startswith("@"):
+            parts = stripped.split(None, 1)
+            stripped = parts[1].strip() if len(parts) > 1 else stripped
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                action = str(payload.get("action", "")).casefold()
+                if action in {"approve", "approved", "confirm", "proceed"}:
+                    return True
+                if action in {"deny", "denied", "cancel", "reject"}:
+                    return False
+        normalized = re.sub(r"[^a-z]+", " ", stripped.casefold()).strip()
         if normalized in {"yes", "approve", "approved", "confirm", "confirmed", "proceed"}:
             return True
         if normalized in {"no", "deny", "denied", "cancel", "reject", "rejected"}:
             return False
+        words = set(normalized.split())
+        if words & {"deny", "denied", "cancel", "reject", "rejected"}:
+            return False
+        if words & {"approve", "approved", "confirm", "confirmed", "proceed"}:
+            return True
         return None
 
     @staticmethod
@@ -430,6 +575,12 @@ class SupervisorService:
     @staticmethod
     def _describe_tool_call(call: PendingToolCall) -> str:
         arguments = call.arguments
+        if call.name == "finalize_administrative_review":
+            return (
+                "generate an audited abnormal-result review PDF for stays longer than "
+                f"{arguments.get('minimum_days')} days (up to "
+                f"{arguments.get('max_pdf_cases')} detailed cases)"
+            )
         if call.name == "send_gmail_outreach":
             return f"send Gmail to {arguments.get('to')} for patient {arguments.get('patient_id')}"
         if call.name == "create_calendar_review":
@@ -469,7 +620,19 @@ def build_uagent():
             for progress in run.progress_messages:
                 await ctx.send(sender, ChatMessage(content=[TextContent(text=progress)]))
             if run.content:
-                await ctx.send(sender, ChatMessage(content=[TextContent(text=run.content)]))
+                content = [TextContent(text=run.content)]
+                if settings.enable_interactive_cards:
+                    if run.tool_calls:
+                        content.append(approval_card(
+                            [service._describe_tool_call(call) for call in run.tool_calls],
+                            session_id=run.session_id,
+                        ))
+                    else:
+                        content.append(outcome_card(
+                            run.content,
+                            session_id=run.session_id,
+                        ))
+                await ctx.send(sender, ChatMessage(content=content))
         except Exception as exc:
             ctx.logger.exception("Supervisor request failed")
             await ctx.send(sender, ChatMessage(content=[TextContent(text=f"Workflow failed: {exc}")]))

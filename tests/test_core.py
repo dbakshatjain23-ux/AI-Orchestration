@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 import tempfile
@@ -20,6 +21,7 @@ from agents.agent_3_clinical_triage import ClinicalTriageAgent
 from agents.agent_5_workspace_sync import ApprovalRequired, PreparedAction, WorkspaceSyncAgent
 from agents.agent_6_compliance_audit import ComplianceAuditAgent
 from agents.supervisor_agent import ASIOnePlannerClient, SupervisorService
+from utils.asi_cards import approval_card, outcome_card
 from utils.dataset_loader import DatasetLoader, DatasetValidationError
 from utils.pdf_builder import build_report
 from services.workflow_orchestrator import WorkflowOrchestrator
@@ -175,6 +177,53 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(ApprovalRequired):
             agent.execute(action)
 
+    def test_interactive_cards_use_official_metadata_envelope(self):
+        approval = approval_card(["generate a review package"], session_id="session-1")
+        self.assertEqual(approval.metadata["card_protocol_version"], "1")
+        self.assertEqual(approval.metadata["card_kind"], "review")
+        payload = json.loads(approval.metadata["card_payload"])
+        self.assertEqual(payload["approve_cta"]["selection"]["action"], "approve")
+        self.assertEqual(payload["reject_cta"]["selection"]["action"], "deny")
+
+        outcome = outcome_card("Finished safely", session_id="session-1")
+        self.assertEqual(outcome.metadata["card_kind"], "custom")
+        self.assertEqual(outcome.metadata["is_terminal"], "true")
+
+    def test_card_json_approval_is_understood(self):
+        self.assertTrue(SupervisorService._approval_decision(
+            '{"action":"approve","session_id":"session-1"}'
+        ))
+        self.assertFalse(SupervisorService._approval_decision(
+            '@careflow {"action":"deny","session_id":"session-1"}'
+        ))
+
+    def test_internal_review_package_requires_approval_and_is_audited(self):
+        tool_call = {
+            "id": "review-1",
+            "type": "function",
+            "function": {
+                "name": "finalize_administrative_review",
+                "arguments": '{"minimum_days":5,"max_pdf_cases":1}',
+            },
+        }
+        planner = FakePlanner([
+            [{"choices": [{"delta": {"tool_calls": [tool_call]}}]}],
+            [{"choices": [{"delta": {"content": "Review package finalized."}}]}],
+        ])
+        service = SupervisorService(ehr=EHRSearchAgent(self.loader), planner=planner)
+        audit = FakeCompliance(allowed=True)
+        service.compliance = audit
+
+        proposed = asyncio.run(service.receive("review-sender", "Create the review"))
+        self.assertIn("Approval required", proposed.content)
+        self.assertEqual(proposed.tool_calls[0].name, "finalize_administrative_review")
+        completed = asyncio.run(service.receive(
+            "review-sender", '{"action":"approve"}'
+        ))
+        self.assertEqual(completed.content, "Review package finalized.")
+        self.assertEqual(audit.events[0]["approved"], True)
+        self.assertEqual(audit.events[0]["result"]["status"], "completed")
+
     def test_pdf_report_is_readable(self):
         from pypdf import PdfReader
 
@@ -263,7 +312,11 @@ class CoreTests(unittest.TestCase):
             [{"choices": [{"delta": {"tool_calls": [calendar_call(1), calendar_call(2)]}}]}],
             [{"choices": [{"delta": {"content": "Both reviews were created."}}]}],
         ])
-        service = SupervisorService(ehr=EHRSearchAgent(self.loader), planner=planner)
+        service = SupervisorService(
+            ehr=EHRSearchAgent(self.loader),
+            planner=planner,
+            allow_google_actions=True,
+        )
         service.workspace = SlowWorkspace(delay=0.15)
         service.compliance = FakeCompliance(allowed=True)
         asyncio.run(service.receive("parallel-sender", "Create both reviews"))
