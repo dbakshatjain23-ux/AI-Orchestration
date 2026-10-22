@@ -1,0 +1,5 @@
+uagents==0.23.7
+google-api-python-client==2.201.0
+google-auth==2.62.0
+python-dotenv==1.1.0
+pytest==8.4.2

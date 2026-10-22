@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+.env
+*.sqlite3*
+credentials*.json
+*service_account*.json
+runtime/
+.pytest_cache/

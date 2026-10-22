@@ -157,3 +157,12 @@ Run the three-pass median performance budget:
 ```
 
 The suite covers CSV validation, SQLite and Parquet materialization, natural-language specialist routing, deterministic analytics, PDFs, concurrent execution, the complete advanced workflow, approval denial, consent blocking, planner session continuity, and all 100 catalogue prompts.
+
+## Standalone Developer 4 contribution
+
+The `developer4/` folder contains the separately developed Workspace Sync and
+Compliance/Audit implementation, its tests, mock demo, synthetic dataset and
+runbooks. It is preserved as a standalone contribution and is not yet connected
+to the application above. See [the contribution guide](developer4/CONTRIBUTION.md)
+before running or integrating it; use its own virtual environment because its
+uAgents version differs from the root application's requirement.
