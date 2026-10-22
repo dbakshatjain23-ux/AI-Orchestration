@@ -77,6 +77,7 @@ class Settings:
     agent_mailbox: bool = _bool_env("AGENT_MAILBOX", False)
     concurrent_messages: bool = _bool_env("AGENT_CONCURRENT_MESSAGES", True)
     enable_google_actions: bool = _bool_env("ENABLE_GOOGLE_ACTIONS", False)
+    enable_dev4_integration: bool = _bool_env("ENABLE_DEV4_INTEGRATION", False)
     enable_interactive_cards: bool = _bool_env("ENABLE_INTERACTIVE_CARDS", True)
     supervisor_port: int = _int_env("SUPERVISOR_PORT", 8000)
     max_external_concurrency: int = _int_env("MAX_EXTERNAL_CONCURRENCY", 4)

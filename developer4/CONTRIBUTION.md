@@ -4,8 +4,10 @@ This folder contains the standalone Developer 4 implementation imported from
 `sirishabh11/healthcare-agent-integrations`, commit `8f71cf2`.
 
 The existing application at the repository root is preserved. These are separate
-implementations; copying this contribution does not wire it into `run_agents.py`,
-`deploy_agent.py`, or the existing supervisor.
+implementations. The root application's optional `ENABLE_DEV4_INTEGRATION=true`
+mode now connects this backend to the existing supervisor and chat specialist
+wrappers; see `../docs/combined_dev4_setup.md`. Do not launch both sets of agents
+on the same ports.
 
 Run this contribution from its own directory and use an isolated virtual environment:
 

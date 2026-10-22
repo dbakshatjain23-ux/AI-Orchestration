@@ -132,11 +132,37 @@ EXTERNAL_ACTION_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+DEV4_ACTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_dev4_workspace_demo",
+        "description": "After explicit human approval, simulate a consent-checked Sheets sync, "
+        "Gmail draft, or internal calendar review using Developer 4. Never sends email or "
+        "contacts Google. Use the exact record_id returned by EHR; never guess a record ID. "
+        "Consent and review restrictions cannot be overridden by approval.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "record_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["sheets_sync", "gmail_draft", "calendar_event"]},
+                "start_at": {"type": "string", "description": "Timezone-aware ISO timestamp for Calendar, otherwise empty"},
+                "end_at": {"type": "string", "description": "Timezone-aware ISO timestamp for Calendar, otherwise empty"},
+            },
+            "required": ["record_id", "action", "start_at", "end_at"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 def planner_tools() -> list[dict[str, Any]]:
     """Return safe local tools plus optional Google Workspace actions."""
 
     tools = list(CORE_ACTION_TOOLS)
-    if settings.enable_google_actions:
+    if settings.enable_dev4_integration:
+        tools.append(DEV4_ACTION_TOOL)
+    elif settings.enable_google_actions:
         tools.extend(EXTERNAL_ACTION_TOOLS)
     return tools
 
@@ -287,6 +313,10 @@ class SupervisorService:
             else allow_google_actions
         )
         self.sessions: dict[str, ConversationState] = {}
+        self.dev4 = None
+        if settings.enable_dev4_integration:
+            from services.dev4_bridge import get_dev4_bridge
+            self.dev4 = get_dev4_bridge()
 
     def handle_local(self, query: str) -> dict[str, Any]:
         """Offline verification path; production chat uses planner sessions."""
@@ -414,7 +444,16 @@ class SupervisorService:
         self, call: PendingToolCall, session_id: str | None = None
     ) -> dict[str, Any]:
         arguments = call.arguments
-        if call.name == "finalize_administrative_review":
+        if self.dev4 is not None and call.name in {
+            "send_gmail_outreach", "create_calendar_review", "append_patient_queue"
+        }:
+            result = {"status": "blocked", "reason": "legacy_google_actions_disabled_in_dev4_mode"}
+        elif call.name == "run_dev4_workspace_demo":
+            if self.dev4 is None:
+                result = {"status": "blocked", "reason": "dev4_integration_disabled"}
+            else:
+                result = self.dev4.execute(arguments, session_id, call.call_id)
+        elif call.name == "finalize_administrative_review":
             minimum_days = int(arguments["minimum_days"])
             max_pdf_cases = int(arguments["max_pdf_cases"])
             if not 0 <= minimum_days <= 3650:
@@ -575,6 +614,9 @@ class SupervisorService:
     @staticmethod
     def _describe_tool_call(call: PendingToolCall) -> str:
         arguments = call.arguments
+        if call.name == "run_dev4_workspace_demo":
+            return (f"simulate {arguments.get('action')} for record {arguments.get('record_id')} "
+                    "(mock only; consent checks still apply)")
         if call.name == "finalize_administrative_review":
             return (
                 "generate an audited abnormal-result review PDF for stays longer than "

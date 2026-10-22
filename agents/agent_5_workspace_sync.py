@@ -156,6 +156,9 @@ class WorkspaceSyncAgent:
 
 
 def build_uagent():
+    if settings.enable_dev4_integration:
+        from services.dev4_bridge import specialist_preview
+        return build_text_uagent('healthcare-workspace-sync', specialist_preview, slot=5)
     service = WorkspaceSyncAgent()
 
     def handle(payload: Any):

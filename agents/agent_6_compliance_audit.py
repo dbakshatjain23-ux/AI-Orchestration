@@ -78,6 +78,9 @@ class ComplianceAuditAgent:
 
 
 def build_uagent():
+    if settings.enable_dev4_integration:
+        from services.dev4_bridge import specialist_preview
+        return build_text_uagent('healthcare-compliance-audit', specialist_preview, slot=6)
     service = ComplianceAuditAgent()
 
     def handle(payload: Any):

@@ -162,7 +162,25 @@ The suite covers CSV validation, SQLite and Parquet materialization, natural-lan
 
 The `developer4/` folder contains the separately developed Workspace Sync and
 Compliance/Audit implementation, its tests, mock demo, synthetic dataset and
-runbooks. It is preserved as a standalone contribution and is not yet connected
-to the application above. See [the contribution guide](developer4/CONTRIBUTION.md)
+runbooks. It remains independently runnable; the optional combined mode below
+connects its backend to the supervisor. See [the contribution guide](developer4/CONTRIBUTION.md)
 before running or integrating it; use its own virtual environment because its
 uAgents version differs from the root application's requirement.
+
+## Combined Developer 4 mode
+
+The supervisor can now use the contributed Developer 4 backend through an opt-in,
+mock-only integration. Set `ENABLE_DEV4_INTEGRATION=true`, keep
+`WORKSPACE_ADAPTER=mock` and Google actions disabled. Agents 5 and 6 expose policy
+previews through the existing chat protocol; approved mock execution runs inside
+the supervisor using Developer 4's SQLite audit and duplicate protection.
+See [combined setup and ASI:One verification](docs/combined_dev4_setup.md).
+
+```powershell
+python -m unittest discover -s tests -v
+python combined_demo.py --record-id REC-000007 --action gmail_draft --decision approve
+python check_asi_setup.py
+```
+
+The combined demo needs no API credentials. `asi_chat.py` uses the live ASI API
+only after the local configuration checks pass; it never auto-approves tools.
