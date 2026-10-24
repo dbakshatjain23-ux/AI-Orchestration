@@ -139,12 +139,29 @@ EXTERNAL_ACTION_TOOLS: list[dict[str, Any]] = [
 ]
 
 
-def planner_tools() -> list[dict[str, Any]]:
-    """Return safe local tools plus optional Google Workspace actions."""
+def planner_tools(request_text: str = "") -> list[dict[str, Any]]:
+    """Expose only actions the user explicitly requested in this turn."""
 
-    tools = list(CORE_ACTION_TOOLS)
+    query = request_text.casefold()
+    tools: list[dict[str, Any]] = []
+    wants_document = (
+        any(verb in query for verb in ("generate", "create", "prepare", "export"))
+        and any(noun in query for noun in ("pdf", "report", "review package", "document"))
+    )
+    if wants_document:
+        tools.extend(CORE_ACTION_TOOLS)
     if settings.enable_google_actions:
-        tools.extend(EXTERNAL_ACTION_TOOLS)
+        requested_names: set[str] = set()
+        if any(term in query for term in ("gmail", "email", "send mail", "outreach")):
+            requested_names.add("send_gmail_outreach")
+        if any(term in query for term in ("calendar", "schedule", "appointment")):
+            requested_names.add("create_calendar_review")
+        if any(term in query for term in ("google sheet", "spreadsheet", "save to sheets")):
+            requested_names.add("append_patient_queue")
+        tools.extend(
+            tool for tool in EXTERNAL_ACTION_TOOLS
+            if tool["function"]["name"] in requested_names
+        )
     return tools
 
 
@@ -360,7 +377,7 @@ class SupervisorService:
                 {"role": "user", "content": query},
             ],
             session_id or str(uuid.uuid4()),
-            planner_tools(),
+            planner_tools(query),
         )
 
     def state_for(self, sender: str) -> ConversationState:
@@ -396,10 +413,33 @@ class SupervisorService:
 
         requirements = self.integration_advisor.requirements_for(text)
         state.last_user_query = text
+        if self.analytics.is_operational_analysis_request(text):
+            result = await asyncio.to_thread(self.analytics.operational_analysis)
+            content = self.analytics.format_operational_analysis(result)
+            activity = [
+                f"Math Analytics filtered {result['billing']['record_count']:,} billing records above $10,000.",
+                "Math Analytics calculated payor and facility billing groups in one pass.",
+                "Math Analytics compared facility LOS using record counts, confidence intervals, and a practical-effect threshold.",
+                f"Math Analytics tested condition + admission-type billing groups; {result['billing_anomalies']['record_count']:,} records met the anomaly rule.",
+            ]
+            state.last_result = content
+            state.messages.append({"role": "user", "content": text})
+            state.messages.append({"role": "assistant", "content": content})
+            state.messages = [state.messages[0], *state.messages[-29:]]
+            return PlannerRun(
+                content=content,
+                progress_messages=activity,
+                integrations=requirements,
+                session_id=state.session_id,
+            )
         planner_context = self.integration_advisor.planner_context(requirements)
         planner_text = f"{text}\n\n{planner_context}" if planner_context else text
         state.messages.append({"role": "user", "content": planner_text})
-        run = await self._run_planner(state, on_progress=on_progress)
+        run = await self._run_planner(
+            state,
+            tools=planner_tools(text),
+            on_progress=on_progress,
+        )
         run.integrations = requirements
         if run.content and not run.tool_calls:
             state.last_result = run.content
@@ -409,12 +449,13 @@ class SupervisorService:
         self,
         state: ConversationState,
         *,
+        tools: list[dict[str, Any]] | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> PlannerRun:
         run = PlannerRun(session_id=state.session_id)
         fragments: dict[str, dict[str, Any]] = {}
         async for event in self.planner.stream_async(
-            state.messages, state.session_id, planner_tools()
+            state.messages, state.session_id, tools or None
         ):
             progress = self._progress_text(event)
             if progress and progress != state.last_progress:
@@ -510,7 +551,9 @@ class SupervisorService:
             })
         state.pending_tool_calls = []
         state.pending_assistant_message = None
-        run = await self._run_planner(state, on_progress=on_progress)
+        # The approved/denied action has already been resolved. Do not expose
+        # the same tool again or the planner can request an approval loop.
+        run = await self._run_planner(state, tools=[], on_progress=on_progress)
         run.execution_results = results
         if run.content:
             state.last_result = run.content
@@ -730,21 +773,18 @@ class SupervisorService:
         metadata = event.get("metadata") or {}
         if metadata.get("type") != "plan_state":
             return None
-        status = metadata.get("plan_status", "in_progress")
-        completed = total = 0
         current_description = ""
         for phase in (metadata.get("phases") or {}).values():
             for task in (phase.get("tasks") or {}).values():
-                total += 1
-                completed += task.get("status") == "completed"
                 if task.get("status") in {"in_progress", "running"}:
                     current_description = str(
                         task.get("description") or task.get("name") or task.get("title") or ""
                     ).strip()
-        detail = f" ({completed}/{total} tasks complete)" if total else ""
         if current_description:
-            return f"Plan status: {status}{detail}. Current step: {current_description}"
-        return f"Plan status: {status}{detail}"
+            return current_description.rstrip(".") + "."
+        if metadata.get("plan_status") == "completed":
+            return "Planner completed the specialist workflow."
+        return None
 
     @staticmethod
     def _describe_tool_call(call: PendingToolCall) -> str:
@@ -772,8 +812,6 @@ def build_uagent():
     from uagents_core.contrib.protocols.chat import (
         ChatAcknowledgement,
         ChatMessage,
-        EndStreamContent,
-        StartStreamContent,
         TextContent,
         chat_protocol_spec,
     )
@@ -791,25 +829,13 @@ def build_uagent():
     @protocol.on_message(model=ChatMessage)
     async def handle(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(sender, ChatAcknowledgement(acknowledged_msg_id=msg.msg_id))
-        stream_id = uuid.uuid4()
-        await ctx.send(
-            sender,
-            ChatMessage(content=[StartStreamContent(stream_id=stream_id)]),
-        )
-
-        async def report_progress(progress: str) -> None:
-            await ctx.send(
-                sender,
-                ChatMessage(content=[TextContent(text=f"\n{progress}\n")]),
-            )
-
         try:
             await ctx.send(
                 sender,
                 ChatMessage(
                     content=[
                         TextContent(
-                            text="CareFlow is checking the request and coordinating the required agents…\n"
+                            text="CareFlow is analyzing the request and coordinating the required specialists…"
                         )
                     ]
                 ),
@@ -817,7 +843,6 @@ def build_uagent():
             run = await service.receive(
                 sender,
                 msg.text().strip(),
-                on_progress=report_progress,
             )
             if run.content:
                 content = [TextContent(text=run.content)]
@@ -839,11 +864,6 @@ def build_uagent():
         except Exception as exc:
             ctx.logger.exception("Supervisor request failed")
             await ctx.send(sender, ChatMessage(content=[TextContent(text=f"Workflow failed: {exc}")]))
-        finally:
-            await ctx.send(
-                sender,
-                ChatMessage(content=[EndStreamContent(stream_id=stream_id)]),
-            )
 
     agent.include(protocol, publish_manifest=True)
     return agent

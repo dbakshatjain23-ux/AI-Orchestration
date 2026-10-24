@@ -21,7 +21,7 @@ from agents.agent_2_math_analytics import MathAnalyticsAgent
 from agents.agent_3_clinical_triage import ClinicalTriageAgent
 from agents.agent_5_workspace_sync import ApprovalRequired, PreparedAction, WorkspaceSyncAgent
 from agents.agent_6_compliance_audit import ComplianceAuditAgent
-from agents.supervisor_agent import ASIOnePlannerClient, SupervisorService
+from agents.supervisor_agent import ASIOnePlannerClient, SupervisorService, planner_tools
 from services.integration_advisor import IntegrationAdvisor
 from utils.asi_cards import approval_card, outcome_card, workflow_result_card
 from utils.dataset_loader import DatasetLoader, DatasetValidationError
@@ -137,6 +137,75 @@ class CoreTests(unittest.TestCase):
             },
         )
 
+    def test_compound_operational_analysis_is_grounded_and_complete(self):
+        analytics = MathAnalyticsAgent()
+        prompt = (
+            "Compare billing above $10,000 by payor and facility. Show totals, "
+            "averages, and the top three outliers. Which facilities have a "
+            "significantly higher average length of stay than the system-wide "
+            "average? Find billing anomalies where the amount is unusually high "
+            "for that condition and admission type."
+        )
+        result = analytics.handle_text(prompt)
+
+        self.assertEqual(result["operation"], "operational_analysis")
+        self.assertEqual(result["billing"]["record_count"], 28_981)
+        self.assertEqual(
+            result["billing"]["by_payor"]["DemoAetna Plan"],
+            {
+                "record_count": 5_810,
+                "total_billing_usd": 218_236_628.65,
+                "average_billing_usd": 37_562.24,
+            },
+        )
+        self.assertEqual(
+            result["billing"]["top_three_records"][0]["record_id"],
+            "REC-053226",
+        )
+        self.assertFalse(any(
+            item["significantly_higher"]
+            for item in result["length_of_stay"]["facilities"].values()
+        ))
+        self.assertEqual(result["billing_anomalies"]["record_count"], 0)
+        self.assertEqual(
+            result["billing_anomalies"]["maximum_observed_z_score"], 1.82
+        )
+
+    def test_compound_analysis_bypasses_planner_actions(self):
+        analytics = MathAnalyticsAgent()
+        planner = FakePlanner([])
+        service = SupervisorService(
+            ehr=EHRSearchAgent(analytics.loader),
+            analytics=analytics,
+            planner=planner,
+        )
+        prompt = (
+            "Compare billing above $10,000 by payor and facility, analyze average "
+            "length of stay, and find unusually high billing anomalies."
+        )
+
+        result = asyncio.run(service.receive("compound-sender", prompt))
+
+        self.assertEqual(planner.session_ids, [])
+        self.assertEqual(result.tool_calls, [])
+        self.assertNotIn("Approval required", result.content)
+        self.assertIn("$218,236,628.65", result.content)
+        self.assertIn("Flagged records: **0**", result.content)
+        self.assertEqual(len(result.progress_messages), 4)
+
+    def test_planner_tools_require_explicit_user_action(self):
+        self.assertEqual(
+            planner_tools("Analyze billing and show an interactive result"), []
+        )
+        self.assertEqual(
+            planner_tools("Find abnormal results and long stays"), []
+        )
+        self.assertEqual(
+            planner_tools("Generate a PDF report for the previous analysis")[0]
+            ["function"]["name"],
+            "finalize_administrative_review",
+        )
+
     def test_specialists_accept_planner_text(self):
         ehr = EHRSearchAgent(self.loader)
         result = ehr.handle_text("Find abnormal stays longer than 5 days")
@@ -225,6 +294,18 @@ class CoreTests(unittest.TestCase):
         self.assertIn("generate_pdf_report", encoded)
         self.assertIn("save_to_google_sheets", encoded)
 
+    def test_workflow_card_hides_pdf_action_after_pdf_completion(self):
+        card = workflow_result_card(
+            "PDF report generated.",
+            execution_results=[{
+                "action": "finalize_administrative_review",
+                "status": "completed",
+            }],
+        )
+        encoded = json.dumps(json.loads(card.metadata["card_payload"]))
+        self.assertNotIn("generate_pdf_report", encoded)
+        self.assertIn("save_to_google_sheets", encoded)
+
     def test_integration_advisor_only_prompts_for_needed_services(self):
         runtime = SimpleNamespace(
             enable_google_actions=False,
@@ -276,7 +357,8 @@ class CoreTests(unittest.TestCase):
         result = asyncio.run(service.receive("trace-sender", "Analyze records", capture))
         self.assertEqual(result.content, "Finished safely.")
         self.assertEqual(progress, result.progress_messages)
-        self.assertIn("Searching grounded records", progress[0])
+        self.assertEqual(progress, ["Searching grounded records."])
+        self.assertNotIn("Plan status", progress[0])
 
     def test_supervisor_rejects_progress_only_planner_completion(self):
         planner = FakePlanner([[
@@ -360,6 +442,7 @@ class CoreTests(unittest.TestCase):
             "review-sender", '{"action":"approve"}'
         ))
         self.assertEqual(completed.content, "Review package finalized.")
+        self.assertIsNone(planner.tools_seen[1])
         self.assertEqual(audit.events[0]["approved"], True)
         self.assertEqual(audit.events[0]["result"]["status"], "completed")
 
@@ -471,10 +554,12 @@ class FakePlanner:
         self.runs = list(runs)
         self.session_ids = []
         self.messages_seen = []
+        self.tools_seen = []
 
     async def stream_async(self, messages, session_id, tools=None):
         self.session_ids.append(session_id)
         self.messages_seen.append([dict(message) for message in messages])
+        self.tools_seen.append(tools)
         for event in self.runs.pop(0):
             yield event
 

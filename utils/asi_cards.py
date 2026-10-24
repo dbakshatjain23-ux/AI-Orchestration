@@ -196,37 +196,42 @@ def workflow_result_card(
         ])
 
     context = {"session_id": session_id} if session_id else {}
+    generated_pdf = any(
+        result.get("action") == "finalize_administrative_review"
+        and result.get("status") == "completed"
+        for result in execution_results
+    )
+    action_buttons: list[Any] = []
+    if not generated_pdf:
+        action_buttons.append(
+            ButtonNode(
+                type="button",
+                label="Generate PDF",
+                primary=True,
+                action=ButtonAction(
+                    selection={"action": "generate_pdf_report", **context}
+                ),
+            )
+        )
+    action_buttons.extend([
+        ButtonNode(
+            type="button",
+            label="Save to Sheets",
+            action=ButtonAction(
+                selection={"action": "save_to_google_sheets", **context}
+            ),
+        ),
+        ButtonNode(
+            type="button",
+            label="Schedule review",
+            action=ButtonAction(
+                selection={"action": "schedule_review", **context}
+            ),
+        ),
+    ])
     children.extend([
         DividerNode(type="divider"),
-        GroupNode(
-            type="group",
-            direction="row",
-            gap=8,
-            children=[
-                ButtonNode(
-                    type="button",
-                    label="Generate PDF",
-                    primary=True,
-                    action=ButtonAction(
-                        selection={"action": "generate_pdf_report", **context}
-                    ),
-                ),
-                ButtonNode(
-                    type="button",
-                    label="Save to Sheets",
-                    action=ButtonAction(
-                        selection={"action": "save_to_google_sheets", **context}
-                    ),
-                ),
-                ButtonNode(
-                    type="button",
-                    label="Schedule review",
-                    action=ButtonAction(
-                        selection={"action": "schedule_review", **context}
-                    ),
-                ),
-            ],
-        ),
+        GroupNode(type="group", direction="row", gap=8, children=action_buttons),
     ])
     payload = CustomCardPayload(
         root=SectionNode(
