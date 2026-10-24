@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.tmp/
+output/
+private_keys.json
+*.sqlite
+*.sqlite-*
+*.parquet
+*.parquet.json

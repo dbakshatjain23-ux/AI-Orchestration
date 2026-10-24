@@ -7,6 +7,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncIterator, Iterator
 
 from agents.agent_1_ehr_search import EHRSearchAgent
@@ -14,9 +15,10 @@ from agents.agent_2_math_analytics import MathAnalyticsAgent
 from agents.agent_5_workspace_sync import WorkspaceSyncAgent
 from agents.agent_6_compliance_audit import ComplianceAuditAgent
 from config import agent_runtime_kwargs, settings
+from services.integration_advisor import IntegrationAdvisor, IntegrationRequirement
 from services.questionnaire_engine import QuestionnaireEngine
 from services.workflow_orchestrator import WorkflowOrchestrator
-from utils.asi_cards import approval_card, outcome_card
+from utils.asi_cards import approval_card, workflow_result_card
 
 
 SUPERVISOR_SYSTEM_PROMPT = """You are CareFlow, an AI hospital-operations supervisor.
@@ -34,6 +36,11 @@ Safety rules:
 - Use finalize_administrative_review when the user asks for a durable abnormal-result,
   long-stay review package. It requires human approval before execution.
 - Explain blocked or partial outcomes and adapt the remaining plan safely.
+- Treat integration readiness supplied with the user request as authoritative. Prepare
+  safe drafts when execution is unavailable, but never claim that a disconnected
+  service was used.
+- In the final answer, state the filters and record counts that were actually used so
+  deterministic results can be reconciled.
 - Keep the final answer concise: objective, agents used, evidence, outcome, and any
   human follow-up required.
 """
@@ -144,6 +151,10 @@ def planner_tools() -> list[dict[str, Any]]:
 _DONE = object()
 
 
+class IncompletePlannerStreamError(RuntimeError):
+    """ASI:One closed a streamed planner response before its DONE sentinel."""
+
+
 @dataclass
 class ASIOnePlannerClient:
     api_key: str = settings.asi_one_api_key
@@ -182,21 +193,35 @@ class ASIOnePlannerClient:
             import requests
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("Install requests to call ASI:One planner mode") from exc
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers=self._headers(session_id),
-            json=self._payload(messages, tools),
-            stream=True,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        for line in response.iter_lines(decode_unicode=True):
-            event = self._decode_sse_line(line)
-            if event is None:
-                continue
-            if event is _DONE:
+        emitted_terminal_data = False
+        for attempt in range(2):
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(session_id),
+                json=self._payload(messages, tools),
+                stream=True,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            saw_done = False
+            for line in response.iter_lines(decode_unicode=True):
+                event = self._decode_sse_line(line)
+                if event is None:
+                    continue
+                if event is _DONE:
+                    saw_done = True
+                    break
+                emitted_terminal_data = (
+                    emitted_terminal_data or self._has_terminal_delta(event)
+                )
+                yield event
+            if saw_done:
                 return
-            yield event
+            if attempt == 0 and not emitted_terminal_data:
+                continue
+            raise IncompletePlannerStreamError(
+                "ASI:One planner stream closed before the completion marker"
+            )
 
     async def stream_async(self, messages, session_id: str, tools=None) -> AsyncIterator[dict[str, Any]]:
         try:
@@ -204,21 +229,44 @@ class ASIOnePlannerClient:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("Install httpx to run the streaming supervisor") from exc
         timeout = httpx.Timeout(self.timeout_seconds, connect=30.0)
+        emitted_terminal_data = False
         async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers=self._headers(session_id),
-                json=self._payload(messages, tools),
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    event = self._decode_sse_line(line)
-                    if event is None:
-                        continue
-                    if event is _DONE:
-                        return
-                    yield event
+            for attempt in range(2):
+                saw_done = False
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=self._headers(session_id),
+                    json=self._payload(messages, tools),
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        event = self._decode_sse_line(line)
+                        if event is None:
+                            continue
+                        if event is _DONE:
+                            saw_done = True
+                            break
+                        emitted_terminal_data = (
+                            emitted_terminal_data or self._has_terminal_delta(event)
+                        )
+                        yield event
+                if saw_done:
+                    return
+                if attempt == 0 and not emitted_terminal_data:
+                    await asyncio.sleep(0.25)
+                    continue
+                raise IncompletePlannerStreamError(
+                    "ASI:One planner stream closed before the completion marker"
+                )
+
+    @staticmethod
+    def _has_terminal_delta(event: dict[str, Any]) -> bool:
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or choice.get("message") or {}
+            if delta.get("content") or delta.get("tool_calls"):
+                return True
+        return False
 
     @staticmethod
     def _decode_sse_line(line: str | bytes) -> dict[str, Any] | object | None:
@@ -229,7 +277,15 @@ class ASIOnePlannerClient:
         data = line[5:].strip()
         if data == "[DONE]":
             return _DONE
-        event = json.loads(data)
+        # ASI:One may interleave keepalive/status markers with JSON SSE events.
+        # They are transport metadata, not planner output, so ignore them rather
+        # than failing the entire user request.
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(event, dict):
+            return None
         if "error" in event:
             raise RuntimeError(f"ASI:One stream error: {event['error']}")
         return event
@@ -254,6 +310,8 @@ class ConversationState:
     pending_tool_calls: list[PendingToolCall] = field(default_factory=list)
     pending_assistant_message: dict[str, Any] | None = None
     last_progress: str = ""
+    last_user_query: str = ""
+    last_result: str = ""
 
 
 @dataclass
@@ -261,6 +319,8 @@ class PlannerRun:
     content: str = ""
     tool_calls: list[PendingToolCall] = field(default_factory=list)
     progress_messages: list[str] = field(default_factory=list)
+    integrations: list[IntegrationRequirement] = field(default_factory=list)
+    execution_results: list[dict[str, Any]] = field(default_factory=list)
     session_id: str | None = None
 
 
@@ -281,6 +341,7 @@ class SupervisorService:
         self.planner = planner or ASIOnePlannerClient()
         self.workspace = WorkspaceSyncAgent()
         self.compliance = ComplianceAuditAgent(self.ehr.loader)
+        self.integration_advisor = IntegrationAdvisor(settings)
         self.allow_google_actions = (
             settings.enable_google_actions
             if allow_google_actions is None
@@ -305,7 +366,12 @@ class SupervisorService:
     def state_for(self, sender: str) -> ConversationState:
         return self.sessions.setdefault(sender, ConversationState())
 
-    async def receive(self, sender: str, text: str) -> PlannerRun:
+    async def receive(
+        self,
+        sender: str,
+        text: str,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> PlannerRun:
         state = self.state_for(sender)
         if state.pending_tool_calls:
             decision = self._approval_decision(text)
@@ -316,11 +382,35 @@ class SupervisorService:
                     tool_calls=list(state.pending_tool_calls),
                     session_id=state.session_id,
                 )
-            return await self._resume_after_decision(state, approved=decision)
-        state.messages.append({"role": "user", "content": text})
-        return await self._run_planner(state)
+            return await self._resume_after_decision(
+                state, approved=decision, on_progress=on_progress
+            )
 
-    async def _run_planner(self, state: ConversationState) -> PlannerRun:
+        selection = self._card_selection(text)
+        if selection:
+            local = self._handle_card_action(state, selection)
+            if isinstance(local, PlannerRun):
+                return local
+            if local:
+                text = local
+
+        requirements = self.integration_advisor.requirements_for(text)
+        state.last_user_query = text
+        planner_context = self.integration_advisor.planner_context(requirements)
+        planner_text = f"{text}\n\n{planner_context}" if planner_context else text
+        state.messages.append({"role": "user", "content": planner_text})
+        run = await self._run_planner(state, on_progress=on_progress)
+        run.integrations = requirements
+        if run.content and not run.tool_calls:
+            state.last_result = run.content
+        return run
+
+    async def _run_planner(
+        self,
+        state: ConversationState,
+        *,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> PlannerRun:
         run = PlannerRun(session_id=state.session_id)
         fragments: dict[str, dict[str, Any]] = {}
         async for event in self.planner.stream_async(
@@ -330,6 +420,8 @@ class SupervisorService:
             if progress and progress != state.last_progress:
                 state.last_progress = progress
                 run.progress_messages.append(progress)
+                if on_progress is not None:
+                    await on_progress(progress)
             for choice in event.get("choices", []):
                 delta = choice.get("delta") or choice.get("message") or {}
                 if delta.get("content"):
@@ -348,6 +440,10 @@ class SupervisorService:
                     elif arguments is not None:
                         current["function"]["arguments"] = arguments
         run.tool_calls = [self._parse_tool_call(raw) for raw in fragments.values()]
+        if not run.content and not run.tool_calls:
+            raise RuntimeError(
+                "ASI:One planner ended without a final answer or actionable tool call"
+            )
         if run.tool_calls:
             state.pending_tool_calls = run.tool_calls
             state.pending_assistant_message = {
@@ -365,7 +461,13 @@ class SupervisorService:
             state.messages = [state.messages[0], *state.messages[-29:]]
         return run
 
-    async def _resume_after_decision(self, state: ConversationState, *, approved: bool) -> PlannerRun:
+    async def _resume_after_decision(
+        self,
+        state: ConversationState,
+        *,
+        approved: bool,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> PlannerRun:
         if state.pending_assistant_message is None:
             raise RuntimeError("Pending tool calls have no assistant message")
         state.messages.append(state.pending_assistant_message)
@@ -408,7 +510,79 @@ class SupervisorService:
             })
         state.pending_tool_calls = []
         state.pending_assistant_message = None
-        return await self._run_planner(state)
+        run = await self._run_planner(state, on_progress=on_progress)
+        run.execution_results = results
+        if run.content:
+            state.last_result = run.content
+        return run
+
+    @staticmethod
+    def _card_selection(text: str) -> dict[str, Any] | None:
+        """Extract a direct card selection while tolerating an @mention prefix."""
+
+        candidate = text.strip()
+        brace = candidate.find("{")
+        if brace < 0:
+            return None
+        try:
+            payload = json.loads(candidate[brace:])
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) and payload.get("action") else None
+
+    def _handle_card_action(
+        self, state: ConversationState, selection: dict[str, Any]
+    ) -> str | PlannerRun | None:
+        action = str(selection.get("action", "")).casefold()
+        previous = state.last_user_query or "the previous CareFlow result"
+        if action == "generate_pdf_report":
+            return (
+                "Generate an administrative PDF report for the previous result. "
+                f"Preserve the filters and evidence from this objective: {previous}"
+            )
+        if action == "save_to_google_sheets":
+            requirements = self.integration_advisor.requirements_for(
+                "Save the previous result to Google Sheets"
+            )
+            if not all(item.ready for item in requirements):
+                return PlannerRun(
+                    content=(
+                        "Google Sheets is not connected on this runtime yet. The result "
+                        "is unchanged and no write was attempted. Configure the service "
+                        "account and enable Google actions, then choose Save to Sheets again."
+                    ),
+                    progress_messages=[
+                        "Integration check completed; Google Sheets setup is required."
+                    ],
+                    integrations=requirements,
+                    session_id=state.session_id,
+                )
+            return (
+                "Save the previous result to Google Sheets. Ask me for the target "
+                "spreadsheet ID and worksheet name before preparing any write."
+            )
+        if action == "schedule_review":
+            requirements = self.integration_advisor.requirements_for(
+                "Schedule a review in Google Calendar"
+            )
+            if not all(item.ready for item in requirements):
+                return PlannerRun(
+                    content=(
+                        "Google Calendar is not connected on this runtime yet. No event "
+                        "was created. Configure the Google connection and enable actions "
+                        "before scheduling the review."
+                    ),
+                    progress_messages=[
+                        "Integration check completed; Google Calendar setup is required."
+                    ],
+                    integrations=requirements,
+                    session_id=state.session_id,
+                )
+            return (
+                "Schedule a care-team review for the previous result. Ask for the date, "
+                "time, duration, and attendee before preparing the calendar action."
+            )
+        return None
 
     def _execute_external_tool(
         self, call: PendingToolCall, session_id: str | None = None
@@ -598,6 +772,8 @@ def build_uagent():
     from uagents_core.contrib.protocols.chat import (
         ChatAcknowledgement,
         ChatMessage,
+        EndStreamContent,
+        StartStreamContent,
         TextContent,
         chat_protocol_spec,
     )
@@ -615,10 +791,34 @@ def build_uagent():
     @protocol.on_message(model=ChatMessage)
     async def handle(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(sender, ChatAcknowledgement(acknowledged_msg_id=msg.msg_id))
+        stream_id = uuid.uuid4()
+        await ctx.send(
+            sender,
+            ChatMessage(content=[StartStreamContent(stream_id=stream_id)]),
+        )
+
+        async def report_progress(progress: str) -> None:
+            await ctx.send(
+                sender,
+                ChatMessage(content=[TextContent(text=f"\n{progress}\n")]),
+            )
+
         try:
-            run = await service.receive(sender, msg.text().strip())
-            for progress in run.progress_messages:
-                await ctx.send(sender, ChatMessage(content=[TextContent(text=progress)]))
+            await ctx.send(
+                sender,
+                ChatMessage(
+                    content=[
+                        TextContent(
+                            text="CareFlow is checking the request and coordinating the required agents…\n"
+                        )
+                    ]
+                ),
+            )
+            run = await service.receive(
+                sender,
+                msg.text().strip(),
+                on_progress=report_progress,
+            )
             if run.content:
                 content = [TextContent(text=run.content)]
                 if settings.enable_interactive_cards:
@@ -628,14 +828,22 @@ def build_uagent():
                             session_id=run.session_id,
                         ))
                     else:
-                        content.append(outcome_card(
+                        content.append(workflow_result_card(
                             run.content,
+                            activity=run.progress_messages,
+                            integrations=run.integrations,
+                            execution_results=run.execution_results,
                             session_id=run.session_id,
                         ))
                 await ctx.send(sender, ChatMessage(content=content))
         except Exception as exc:
             ctx.logger.exception("Supervisor request failed")
             await ctx.send(sender, ChatMessage(content=[TextContent(text=f"Workflow failed: {exc}")]))
+        finally:
+            await ctx.send(
+                sender,
+                ChatMessage(content=[EndStreamContent(stream_id=stream_id)]),
+            )
 
     agent.include(protocol, publish_manifest=True)
     return agent

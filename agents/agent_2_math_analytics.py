@@ -40,14 +40,17 @@ class MathAnalyticsAgent:
         abnormal = population["test_result"].astype("string").str.casefold().eq("abnormal")
         return round(float(abnormal.mean() * 100), 2)
 
-    def billing_summary(self, by: str) -> dict[str, dict[str, float | int]]:
+    def billing_summary(
+        self, by: str, **criteria: Any
+    ) -> dict[str, dict[str, float | int]]:
         self.loader._require_columns([by])
-        grouped = self.frame.groupby(by, dropna=False)["billing_amount_usd"].agg(
+        population = self.loader.filter(**criteria) if criteria else self.frame
+        grouped = population.groupby(by, dropna=False)["billing_amount_usd"].agg(
             ["count", "sum", "mean"]
         )
         return {
             str(key): {
-                "admissions": int(row["count"]),
+                "record_count": int(row["count"]),
                 "total_billing_usd": round(float(row["sum"]), 2),
                 "average_billing_usd": round(float(row["mean"]), 2),
             }
@@ -126,7 +129,21 @@ class MathAnalyticsAgent:
                     "result": self.top_records("billing_amount_usd", int(top.group(1)) if top else 10),
                 }
             group = "payor_name" if ("payor" in query or "payer" in query or "insurance" in query) else "facility_name"
-            return {"operation": "billing_summary", "group_by": group, "result": self.billing_summary(group)}
+            criteria: dict[str, Any] = {}
+            threshold = re.search(
+                r"(?:above|over|more than|greater than|>)\s*\$?([\d,.]+)",
+                query,
+            )
+            if threshold:
+                criteria["billing_amount_usd__gt"] = float(
+                    threshold.group(1).replace(",", "")
+                )
+            return {
+                "operation": "billing_summary",
+                "group_by": group,
+                "criteria": criteria,
+                "result": self.billing_summary(group, **criteria),
+            }
         return {
             "status": "needs_input",
             "message": "Specify an average, percentage, comparison, admission-count, billing, or top-record calculation.",
@@ -145,7 +162,9 @@ def build_uagent():
         if operation == "abnormal_percentage":
             return {"result": service.abnormal_result_percentage(**payload.get("criteria", {}))}
         if operation == "billing_summary":
-            return service.billing_summary(payload["by"])
+            return service.billing_summary(
+                payload["by"], **payload.get("criteria", {})
+            )
         if operation == "admission_counts":
             return service.admission_counts(payload["by"])
         if operation == "compare_conditions":

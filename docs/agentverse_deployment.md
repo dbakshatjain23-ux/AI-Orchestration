@@ -6,7 +6,8 @@
 This repository supports two runtime modes without changing business logic:
 
 - Local HTTP mode: all seven ports through `run_agents.py`.
-- Agentverse mailbox mode: one long-running role through `deploy_agent.py`.
+- Agentverse mailbox mode: one role through `deploy_agent.py`, or the complete
+  long-running stack through `run_agents.py`.
 
 Mailbox mode is the recommended first deployment path for this repository because
 the shared dataset and Python dependencies remain in a normal Python runtime while
@@ -64,7 +65,21 @@ Repeat in this order:
 5. `workspace`
 6. `compliance`
 
-For a persistent cloud worker, use the same repository and command:
+Stopping the command makes that Mailbox agent inactive. Registration is not
+lost: restart the same role with the same `AGENT_SEED` and it reconnects to the
+same Agentverse entry and address. Do not delete and recreate inactive agents.
+
+While registering later roles, keep the earlier roles active in one terminal:
+
+```powershell
+.\.venv\Scripts\python.exe run_agents.py --only ehr analytics triage documents workspace compliance
+```
+
+Each role uses its own local port. Connect the Inspector URLs for any roles not
+yet registered. Once all roles are registered, this is also the recommended
+single-machine specialist command.
+
+For seven separately managed cloud workers, use the same repository and command:
 
 ```text
 python deploy_agent.py --agent <role>
@@ -93,7 +108,48 @@ Then start and register it:
 .\.venv\Scripts\python.exe deploy_agent.py
 ```
 
-## 5. ASI:One acceptance flow
+After the Supervisor is registered, put its six specialist addresses in the
+shared environment and run the entire stack together:
+
+```powershell
+.\.venv\Scripts\python.exe run_agents.py
+```
+
+All seven Agentverse entries should become Active. `Ctrl+C` stops the stack and
+they become inactive until the same command is restarted.
+
+## 5. Keep the agents online continuously
+
+Agentverse Mailbox provides identity, queued delivery, discovery, and ASI:One
+connectivity. The Python runtime still runs on your infrastructure. Choose one:
+
+1. **Hackathon/local demo:** leave `run_agents.py` running on the laptop.
+2. **Simplest persistent deployment:** deploy this repository as one background
+   worker using `python run_agents.py`.
+3. **Maximum failure isolation:** deploy seven workers, each with a distinct
+   `AGENT_ROLE`, using `python deploy_agent.py`.
+
+The repository includes `Dockerfile`, `.dockerignore`, and `Procfile`. For a
+container worker, configure the common environment from section 2 plus all six
+specialist addresses, then use the image's default command. Do not expose a port;
+Mailbox mode makes outbound HTTPS connections.
+
+The 52 MB synthetic dataset is intentionally packaged with the worker. Hosted
+Agentverse agents are lightweight and have a restricted dependency environment;
+this application relies on pandas, PyArrow, PDF libraries, and a local dataset,
+so a persistent Mailbox worker is the direct deployment path. A later hosted
+refactor should make Agentverse-hosted agents thin clients of a separately hosted
+data service rather than uploading the current application unchanged.
+
+### Connectivity failures
+
+`503`, `getaddrinfo failed`, or `Network location cannot be reached` messages for
+`agentverse.ai` mean the worker cannot currently resolve or reach Agentverse.
+The mailbox client retries automatically, but the agent remains unavailable until
+connectivity returns. Verify DNS/HTTPS access, VPN/firewall policy, and try a
+different network. A cloud worker also removes dependence on the laptop network.
+
+## 6. ASI:One acceptance flow
 
 Directly mention the Supervisor in ASI:One and send:
 
@@ -112,7 +168,7 @@ Acceptance criteria:
 6. Approve generates the grounded report, appends an audit event, and resumes ASI:One.
 7. The final response identifies source facts, agents used, generated outcome, and required human follow-up.
 
-## 6. Submission evidence
+## 7. Submission evidence
 
 Capture and publish:
 

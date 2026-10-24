@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .tmp/
 output/
+private_keys.json
 credentials*.json
 service-account*.json
 

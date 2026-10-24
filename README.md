@@ -40,6 +40,12 @@ The Supervisor also exposes an approval-gated
 package and audit evidence without requiring Google Workspace. ASI:One Interactive
 Cards provide native Approve/Deny controls and a terminal outcome view.
 
+The chat experience also uses ACP streaming and a non-terminal CareFlow operations
+card. It presents a compact numeric visualization when possible, an auditable Agent
+Activity trace, just-in-time integration readiness, and safe next actions for PDF,
+Google Sheets, and Calendar. Raw private chain-of-thought is never exposed; the trace
+shows observable plan and execution evidence instead.
+
 Every service publishes the Agent Chat Protocol 0.3.0 manifest. Specialist agents accept both planner-friendly plain text and canonical structured JSON. The source CSV remains read-only; `main.py --build-index` creates an indexed SQLite copy plus a source-fingerprinted Parquet cache. Agents prefer the Parquet cache for fast startup and automatically fall back when it is missing or stale.
 
 ## Setup
@@ -98,6 +104,9 @@ Or start a subset:
 Once deployed, put the six specialist `agent1q...` addresses in `.env`, start/deploy the Supervisor, then @mention it in ASI:One Chat. A representative full-flow prompt is:
 
 > Find patients with abnormal results and stays longer than 30 days. Use the specialist agents to analyze and prioritize the cohort, then prepare an audited administrative review package with at most 10 detailed cases. Do not contact patients or use Google Workspace.
+
+See [`docs/demo_playbook.md`](docs/demo_playbook.md) for analytics, flagship workflow,
+integration, safety, and failure-recovery prompts with acceptance checks.
 
 The planner may call specialists immediately, but durable report creation and optional
 Gmail, Calendar, and Sheets calls return to the Supervisor as tools. The Supervisor

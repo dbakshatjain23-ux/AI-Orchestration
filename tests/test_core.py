@@ -7,6 +7,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -21,7 +22,8 @@ from agents.agent_3_clinical_triage import ClinicalTriageAgent
 from agents.agent_5_workspace_sync import ApprovalRequired, PreparedAction, WorkspaceSyncAgent
 from agents.agent_6_compliance_audit import ComplianceAuditAgent
 from agents.supervisor_agent import ASIOnePlannerClient, SupervisorService
-from utils.asi_cards import approval_card, outcome_card
+from services.integration_advisor import IntegrationAdvisor
+from utils.asi_cards import approval_card, outcome_card, workflow_result_card
 from utils.dataset_loader import DatasetLoader, DatasetValidationError
 from utils.pdf_builder import build_report
 from services.workflow_orchestrator import WorkflowOrchestrator
@@ -116,6 +118,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(analytics.abnormal_result_percentage(), 50.0)
         self.assertEqual(analytics.average_length_of_stay(), 15.0)
 
+    def test_billing_summary_preserves_threshold_filter(self):
+        analytics = MathAnalyticsAgent(self.loader)
+        result = analytics.handle_text(
+            "Give count and total billing grouped by payor for records above $2,000"
+        )
+        self.assertEqual(
+            result["criteria"], {"billing_amount_usd__gt": 2000.0}
+        )
+        self.assertEqual(
+            result["result"],
+            {
+                "Plan B": {
+                    "record_count": 1,
+                    "total_billing_usd": 3000.0,
+                    "average_billing_usd": 3000.0,
+                }
+            },
+        )
+
     def test_specialists_accept_planner_text(self):
         ehr = EHRSearchAgent(self.loader)
         result = ehr.handle_text("Find abnormal stays longer than 5 days")
@@ -189,6 +210,114 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(outcome.metadata["card_kind"], "custom")
         self.assertEqual(outcome.metadata["is_terminal"], "true")
 
+    def test_workflow_card_contains_visual_trace_and_actions(self):
+        card = workflow_result_card(
+            """Billing summary\n\n| Payor | Total Billing |\n|---|---:|\n| Plan A | $10,000 |\n| Plan B | $5,000 |""",
+            activity=["EHR Search selected 2 records", "Math Analytics grouped 2 payors"],
+            session_id="session-1",
+        )
+        payload = json.loads(card.metadata["card_payload"])
+        encoded = json.dumps(payload)
+        self.assertEqual(card.metadata["card_kind"], "custom")
+        self.assertNotIn("is_terminal", card.metadata)
+        self.assertIn("Agent activity", encoded)
+        self.assertIn("Total Billing by Payor", encoded)
+        self.assertIn("generate_pdf_report", encoded)
+        self.assertIn("save_to_google_sheets", encoded)
+
+    def test_integration_advisor_only_prompts_for_needed_services(self):
+        runtime = SimpleNamespace(
+            enable_google_actions=False,
+            google_service_account_file="",
+            google_delegated_user="",
+        )
+        advisor = IntegrationAdvisor(runtime)
+        self.assertEqual(
+            advisor.requirements_for("Analyze billing above $10,000 by payor"), []
+        )
+        self.assertEqual(
+            advisor.requirements_for("Analyze cases with missing email consent"), []
+        )
+        requirements = advisor.requirements_for(
+            "Create a PDF and email it, then save the results to Google Sheets"
+        )
+        status = {item.key: item.status for item in requirements}
+        self.assertEqual(status["documents"], "ready")
+        self.assertEqual(status["gmail"], "setup_required")
+        self.assertEqual(status["sheets"], "setup_required")
+
+    def test_planner_progress_callback_receives_execution_trace(self):
+        planner = FakePlanner([[
+            {
+                "choices": [],
+                "metadata": {
+                    "type": "plan_state",
+                    "plan_status": "in_progress",
+                    "phases": {
+                        "0": {
+                            "tasks": {
+                                "0": {
+                                    "status": "running",
+                                    "description": "Searching grounded records",
+                                }
+                            }
+                        }
+                    },
+                },
+            },
+            {"choices": [{"delta": {"content": "Finished safely."}}]},
+        ]])
+        service = SupervisorService(ehr=EHRSearchAgent(self.loader), planner=planner)
+        progress = []
+
+        async def capture(message):
+            progress.append(message)
+
+        result = asyncio.run(service.receive("trace-sender", "Analyze records", capture))
+        self.assertEqual(result.content, "Finished safely.")
+        self.assertEqual(progress, result.progress_messages)
+        self.assertIn("Searching grounded records", progress[0])
+
+    def test_supervisor_rejects_progress_only_planner_completion(self):
+        planner = FakePlanner([[
+            {
+                "choices": [],
+                "metadata": {
+                    "type": "plan_state",
+                    "plan_status": "in_progress",
+                    "phases": {
+                        "0": {
+                            "tasks": {
+                                "0": {
+                                    "status": "running",
+                                    "description": "Analyzing billing and length of stay",
+                                }
+                            }
+                        }
+                    },
+                },
+            }
+        ]])
+        service = SupervisorService(ehr=EHRSearchAgent(self.loader), planner=planner)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "without a final answer or actionable tool call",
+        ):
+            asyncio.run(service.receive("progress-only", "Analyze billing"))
+
+    def test_planner_terminal_delta_detection_ignores_plan_status(self):
+        self.assertFalse(ASIOnePlannerClient._has_terminal_delta({
+            "choices": [],
+            "metadata": {"type": "plan_state", "plan_status": "in_progress"},
+        }))
+        self.assertTrue(ASIOnePlannerClient._has_terminal_delta({
+            "choices": [{"delta": {"content": "Analysis complete."}}],
+        }))
+        self.assertTrue(ASIOnePlannerClient._has_terminal_delta({
+            "choices": [{"delta": {"tool_calls": [{"id": "call-1"}]}}],
+        }))
+
     def test_card_json_approval_is_understood(self):
         self.assertTrue(SupervisorService._approval_decision(
             '{"action":"approve","session_id":"session-1"}'
@@ -196,6 +325,16 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(SupervisorService._approval_decision(
             '@careflow {"action":"deny","session_id":"session-1"}'
         ))
+
+    def test_asi_stream_ignores_non_json_status_markers(self):
+        self.assertIsNone(ASIOnePlannerClient._decode_sse_line("data: [KEEPALIVE]"))
+        self.assertIsNone(ASIOnePlannerClient._decode_sse_line("data: 42"))
+        self.assertEqual(
+            ASIOnePlannerClient._decode_sse_line(
+                'data: {"choices":[{"delta":{"content":"ok"}}]}'
+            )["choices"][0]["delta"]["content"],
+            "ok",
+        )
 
     def test_internal_review_package_requires_approval_and_is_audited(self):
         tool_call = {
